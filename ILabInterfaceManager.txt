@@ -1,0 +1,34 @@
+using Docktor2.DataAccess.BusinessModels.Laboratory;
+using System.Collections.Generic;
+
+namespace Docktor2.Business.Interfaces
+{
+    interface ILabInterfaceManager
+    {
+        /// <summary>
+        /// Generates HL7 file, and place it in OUT folder.
+        /// </summary>
+        bool GenerateHl7File(SubmitLabOrderDataModel submitlabOrderDataModel);
+
+        /// <summary>
+        /// Processes the lab results returned by the vendor, and update the system.
+        /// </summary>
+        List<ILabTestResult> ProcessLabResults();
+        
+        /// <summary>
+        /// Returns the attachments names if any from the response hl7 file.
+        /// </summary>
+        IEnumerable<string> GetAttachmentsNames(string filePath);
+
+        /// <summary>
+        /// Returns the attachment in bytes from the response hl7 file.
+        /// </summary>
+        byte[] GetAttachmentBytes(string filePath, int attachmentIndex, out string fileName);
+
+
+        /// <summary>
+        /// Generate Barcode Segments or Barcode Data if applicable for the lab interface
+        /// </summary>
+        BarcodeDataModel GetBarcodeSegments(SubmitLabOrderDataModel submitlabOrderDataModel);
+    }
+}

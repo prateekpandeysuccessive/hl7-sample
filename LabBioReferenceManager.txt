@@ -1,0 +1,413 @@
+using Docktor2.Business.Interfaces;
+using Docktor2.DataAccess;
+using Docktor2.DataAccess.BusinessModels.Enumerators;
+using Docktor2.DataAccess.BusinessModels.Laboratory;
+using Docktor2.DataAccess.Caching.ClientSettings;
+using Docktor2.DataAccess.Security;
+using Docktor2.DataAccess.Utility;
+using Docktor2.InmateMedicationManagement.BusinessLogic;
+using Docktor2.SlimUtils;
+using System;
+using System.Collections.Generic;
+using System.Data.Entity.Core.Objects.DataClasses;
+using System.IO;
+using System.Linq;
+using Docktor2.Business.Utility;
+using static Constants;
+
+namespace Docktor2.Business.LabManagers
+{
+    public class LabBioReferenceManager : ILabInterfaceManager
+    {
+        #region Fields
+
+        static readonly char _fieldSeparator = '|';
+        static readonly char _subFieldSeparator = '^';
+        static readonly string _dateFormat = "yyyyMMdd";
+        static readonly string _dateTimeFormat = "yyyyMMddHHmm";
+
+        #endregion
+
+        #region Properties
+
+        string _accountNumber;
+        string AccountNumber => _accountNumber ?? (_accountNumber = SystemOptionManager.GetLabBrAccountNumber());
+
+        LabManager _labManager;
+        LabManager LabManager => _labManager ?? (_labManager = new LabManager());
+
+        ProviderOrdersManager _otherOrderManager;
+        ProviderOrdersManager OtherOrderManager => _otherOrderManager ?? (_otherOrderManager = new ProviderOrdersManager());
+
+        SystemOptionManager _systemOptionManager;
+        SystemOptionManager SystemOptionManager => _systemOptionManager ?? (_systemOptionManager = new SystemOptionManager());
+
+        #endregion
+
+        #region Public Methods
+
+        /// <summary>
+        /// Generate the HL7 file for BioReference Lab
+        /// </summary>
+        public bool GenerateHl7File(SubmitLabOrderDataModel submitLabOrderDataModel)
+        {
+            int submitToLabOrderDetailId = submitLabOrderDataModel.SubmitToLabOrderDetailId;
+            var orderDetail = LabManager.GetSubmitToLabOrderDetail(submitToLabOrderDetailId);
+            var firstOtherOrder = orderDetail?.OtherOrders.FirstOrDefault();
+            var inmate = firstOtherOrder?.Inmate;
+            if (inmate == null) return false;
+
+            var mshSegment = Hl7Utility.GetMessageHeaderSegment(submitToLabOrderDetailId.ToString(), "ORM^O01",
+                SystemOptionManager.GetLabBrHl7MhVendorIdentifier(), AccountNumber, "BIOR", AccountNumber,
+                SystemOptionManager.GetLabBrHl7MhProductionMode() ? "P" : "T", Hl7Utility.DateTimeFormat, 16);
+
+            var pidSegment = Hl7Utility.GetPatientIdentificationSegment(patientIdExternal: inmate.OffenderId,
+                patientIdInternal: null,
+                patientIdAlternate: null,
+                patientFirstName: inmate.FirstName,
+                patientMiddleName: inmate.MiddleName,
+                patientLastName: inmate.LastName,
+                inmateDateOfBirth: inmate.DateOfBirth,
+                sex: inmate.SexText,
+                patientAddress: SystemOptionManager.GetLabBrHl7PidPatientAddress(),
+                homePhoneOrEmail: SystemOptionManager.GetLabBrHl7PidPatientNumberEmail(),
+                patientAccountNumber: null,
+                noOfFieldsToExport: 20);
+
+            var pv1Segment = Hl7Utility.GetPatientVisitSegment(AccountNumber, null, 15);
+
+            var in1Segment = Hl7Utility.GetInsuranceInformationSegment(inmate.FirstName, inmate.LastName, SystemOptionManager.GetLabBrHl7In1InsCoId(),
+                SystemOptionManager.GetLabBrHl7In1InsCoName(), SystemOptionManager.GetLabBrHl7In1InsCoAddress(), SystemOptionManager.GetLabBrHl7In1GroupNumber(),
+                SystemOptionManager.GetLabBrHl7PidPatientAddress(), SystemOptionManager.GetLabBrHl7In1PolicyNumber(),
+                SystemOptionManager.GetLabBrHl7In1BillingCode());
+
+            var gt1Segment = Hl7Utility.GetGuarantorInformationSegment(SystemOptionManager.GetLabBrHl7Gt1Name(), SystemOptionManager.GetLabBrHl7Gt1Address(),
+                SystemOptionManager.GetLabBrHl7Gt1Relationship());
+
+            var dg1Segment = Hl7Utility.GetDiagnosisInformationSegment(SystemOptionManager.GetLabBrHl7Dg1CodingMethod(),
+                SystemOptionManager.GetLabBrHl7Dg1Code(), SystemOptionManager.GetLabBrHl7Dg1Description());
+
+            string orderingProvider;
+            if (firstOtherOrder.State != (int)OrderState.PaperEntry)
+            {
+                var user = SecurityManager.GetUserInfoById(firstOtherOrder.OrderedByUserId);
+                var npiNumber = string.IsNullOrWhiteSpace(user.NPINumber)
+                    ? SystemOptionManager.GetLabBrHl7OrcDefaultProviderNpiNo()
+                    : user.NPINumber;
+                orderingProvider = string.Format("{1}{0}{2}{0}{3}", _subFieldSeparator, npiNumber, user.FirstName, user.LastName);
+            }
+            else
+            {
+                orderingProvider = string.Format("{1}{0}{2}{0}{3}", _subFieldSeparator, SystemOptionManager.GetLabBrHl7OrcDefaultProviderNpiNo(),
+                    firstOtherOrder.OtherProvider, string.Empty);
+            }
+
+            var currentDateTime = DateTimeUtility.CurrentDateTime;
+            var orcSegment = Hl7Utility.GetCommonOrderInformationSegment("NW", $"{submitToLabOrderDetailId}{Hl7Utility.SubFieldSeparator}{AccountNumber}",
+                orderingProvider, currentDateTime, null, null, null, Hl7Utility.DateTimeFormat, DateTimeUtility.CurrentDateTime, 16);
+
+            var obrSegments = string.Empty;
+            var obrCounter = 1;
+            var submittedObxAOEs = LabManager.GetSubmittedObxAOEsAnswerFromSession(submitToLabOrderDetailId);
+            foreach (var otherOrder in orderDetail.OtherOrders)
+            {
+                var otherOrderSubType = otherOrder.InmateProviderOrderSubtypes.FirstOrDefault()?.OtherOrdersSubType;
+                obrSegments += Hl7Utility.GetObservationRequestInformation(obrCounter++, otherOrder.NMO.ToString(),
+                    otherOrderSubType?.LabBrOtherOrdersSubTypesInfo?.TestNumber, otherOrderSubType?.Name, orderingProvider,
+                    currentDateTime, SystemOptionManager.GetLabBrHl7ObrRelevantClinicalInfo()) + Environment.NewLine;
+
+                if (submittedObxAOEs != null)
+                {
+                    var obxAoe = submittedObxAOEs.FirstOrDefault(x => x.OtherOrderId == otherOrder.Id);
+                    if (obxAoe != null && obxAoe.SubmitToLabOrderDetailObxAOEAnswers != null)
+                    {
+                        //add OBX segments per OBR
+                        obrSegments += GetAskOnEntryObxSegment(obxAoe);
+                    }
+                }
+            }
+
+            var hl7OrderFileContent = string.Format("{1}{0}{2}{0}{3}{0}{4}{0}{5}{0}{6}{0}{7}{0}{8}", Environment.NewLine,
+                mshSegment, pidSegment, pv1Segment, in1Segment, gt1Segment, dg1Segment, orcSegment, obrSegments);
+
+            var directory = SystemOptionManager.GetLabBrHl7OrderFilesDirectoryPath();
+            if (!Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            var fileName = $"{directory}\\{submitToLabOrderDetailId}.txt";
+            using (var st = new StreamWriter(File.Create(fileName)))
+            {
+                st.Write(hl7OrderFileContent);
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Process the lab results sent by the Bioreference to us.
+        /// Read all the files from IN folder, and update the system.
+        /// </summary>
+        public List<ILabTestResult> ProcessLabResults()
+        {
+            var currentDateTime = DateTimeUtility.CurrentDateTime;
+            var filesData = new List<ILabTestResult>();
+            var filesToProcess = Directory.GetFiles(SystemOptionManager.GetLabBrHl7ResultFilesDirectoryPath());
+            foreach (var filePath in filesToProcess)
+            {
+                var fileData = ProcessLabResultFile(currentDateTime, filePath);
+                if (fileData != null)
+                {
+                    filesData.Add(fileData);
+                }
+            }
+            return filesData;
+        }
+
+        /// <summary>
+        /// Return attachments names if there is any in reponse hl7 file.
+        /// </summary>
+        public IEnumerable<string> GetAttachmentsNames(string filePath)
+        {
+            if (!File.Exists(filePath)) return null;
+
+            var headers = File.ReadAllLines(filePath).Where(x => x.StartsWith(Hl7Headers.ObservationResult + _fieldSeparator));
+            if (!headers.Any()) return null;
+
+            List<string> attachmentNames = new List<string>();
+            foreach (var header in headers)
+            {
+                var fields = header.Split(_fieldSeparator);
+                if (fields.Length < 6 || fields[2] != "ED") continue;
+
+                var resultInfo = fields[3].Split(_subFieldSeparator);
+                if (resultInfo.Length < 2) break;
+
+                var attchArray = fields[5].Split(_subFieldSeparator);
+                if (attchArray.Length < 3) break;
+
+                attachmentNames.Add($"{resultInfo[1]}.{attchArray[2].Trim().ToLower()}");
+            }
+            return attachmentNames;
+        }
+
+        /// <summary>
+        /// Returns the hl7 result attachment in bytes.
+        /// </summary>
+        public byte[] GetAttachmentBytes(string filePath, int attachmentIndex, out string fileName)
+        {
+            fileName = null;
+            if (!File.Exists(filePath)) return null;
+            var headers = File.ReadAllLines(filePath).Where(x => x.StartsWith(Hl7Headers.ObservationResult + _fieldSeparator));
+            if (!headers.Any()) return null;
+
+            var index = 0;
+            foreach (var header in headers)
+            {
+                var fields = header.Split(_fieldSeparator);
+                if (fields.Length < 6 || fields[2] != "ED") continue;
+
+                index++;
+                if (index == attachmentIndex)
+                {
+                    var resultInfo = fields[3].Split(_subFieldSeparator);
+                    if (resultInfo.Length < 2) break;
+
+                    var attchArray = fields[5].Split(_subFieldSeparator);
+                    if (attchArray.Length < 5) break;
+
+                    fileName = $"{resultInfo[1]}.{attchArray[2].Trim().ToLower()}";
+                    return Convert.FromBase64String(attchArray[4]);
+                }
+            }
+            return null;
+        }
+
+        #endregion
+
+        #region Private Helper Methods
+
+        /// <summary>
+        /// Get ask on entry question and answer (OBX AOE data)
+        /// </summary>
+        string GetAskOnEntryObxSegment(SubmitToLabOrderDetailObxAO submittedObxAOEAnswers)
+        {
+            var obxSegments = string.Empty;
+            int seqId = 1;
+            foreach (var answer in submittedObxAOEAnswers.SubmitToLabOrderDetailObxAOEAnswers)
+            {
+                var questionAndCode = answer.QuestionCode + _subFieldSeparator + answer.Question;
+                obxSegments += string.Format("{1}{0}{2}{0}{3}{0}{4}{0}{0}{5}", _fieldSeparator, Hl7Headers.ObservationResult,
+                                            seqId++, "ST", questionAndCode, answer.DisplayAnswerValue) + Environment.NewLine;
+            }
+            return obxSegments;
+        }
+
+        #region HL7 Result File Processing Methods
+
+        LabBrHl7ResultFileData ProcessLabResultFile(DateTime currentDateTime, string filePath)
+        {
+            if (!File.Exists(filePath)) return null;
+
+            var headers = File.ReadAllLines(filePath);
+            var fileData = new LabBrHl7ResultFileData
+            {
+                SourceFileName = Path.GetFileName(filePath),
+                SourceFilePath = filePath,
+                SubmitToLabOrderDetailObrs = new List<SubmitToLabOrderDetailObr>()
+            };
+
+            int obrSetId = 0;
+            bool isObxProcessed = false;
+
+            foreach (var header in headers)
+            {
+                var fields = header.Split(_fieldSeparator);
+                switch (fields[0])
+                {
+                    case Hl7Headers.MessageHeader:
+                        if (fields.Length >= 11)
+                        {
+                            fileData.SubmitToLabId = fields[9]?.Trim().GetIntegerValue(0) ?? 0;
+                        }
+                        break;
+                    case Hl7Headers.PatientIdentification:
+                        if (fields.Length >= 3)
+                        {
+                            fileData.InmateOffenderId = fields[2]?.Trim();
+
+                            if (fields.Length >= 6)
+                            {
+                                var name = fields[5].Trim().Split(_subFieldSeparator);
+                                fileData.InmateLastName = name.Length > 0 ? name[0] : null;
+                                fileData.InmateFirstName = name.Length > 1 ? name[1] : null;
+                                fileData.InmateMiddleName = name.Length > 2 ? name[2] : null;
+
+                                if (fields.Length >= 8)
+                                {
+                                    fileData.InmateDob = fields[7].Trim().GetDateTime(_dateFormat);
+
+                                    if (fields.Length >= 9)
+                                    {
+                                        fileData.InmateGender = fields[8].Substring(0, 1);
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    case Hl7Headers.PatientVisit:
+                        break;
+                    case Hl7Headers.CommonOrder:
+                        if (fields.Length > 2)
+                        {
+                            var placerOrderNumber = fields[2]?.Trim().Split(_subFieldSeparator);
+                            if (placerOrderNumber != null && placerOrderNumber.Length >= 1)
+                            {
+                                fileData.SubmitToLabId = placerOrderNumber[0]?.Trim().GetIntegerValue(0) ?? 0;
+                            }
+
+                            if (fields.Length > 3)
+                            {
+                                fileData.AccessionNumber = fields[3]?.Trim();
+
+                                if (fields.Length > 15)
+                                {
+                                    fileData.CollectionDateTime = fields[15].GetDateTime(_dateTimeFormat);
+                                }
+                            }
+                        }
+                        break;
+                    case Hl7Headers.ObservationRequest:
+                        if (fields.Length > 2)
+                        {
+                            var nmoNumber = 0;
+                            var placerNumber = fields[2]?.Trim().Split(_subFieldSeparator);
+                            if (placerNumber != null && placerNumber.Any())
+                            {
+                                nmoNumber = placerNumber[0].GetIntegerValue(0);
+                            }
+                            var testInfo = fields[4].Trim().Split(_subFieldSeparator);
+                            var statusType = fields.Length > 25 ? fields[25]?.Trim().ToUpper() : string.Empty;
+                            fileData.SubmitToLabOrderDetailObrs.Add(new SubmitToLabOrderDetailObr
+                            {
+                                TestCode = testInfo[0].Trim(),
+                                TestName = testInfo[1].Trim(),
+                                OtherOrderId = OtherOrderManager.GetOtherOrderByNmo(nmoNumber)?.Id ?? 0,
+                                SetId = fields[1].GetIntegerValue(1),
+                                LaboratoryInformation = fields.Length > 20 ? fields[20]?.Trim() : string.Empty,
+                                Status = statusType == "F"
+                                    ? (int)LabResultStatus.Final
+                                    : (statusType == "P" ? (int)LabResultStatus.Preliminary : (int)LabResultStatus.Corrected),
+                                CreatedOn = currentDateTime,
+                                SubmitToLabOrderDetailObrResults = new EntityCollection<SubmitToLabOrderDetailObrResult>()
+                            });
+                        }
+                        break;
+                    case Hl7Headers.ObservationResult:
+                        isObxProcessed = true;
+
+                        if (fields.Length < 4 || fields[2] == "ED") break;
+
+                        var resultInfo = fields[3].Split(_subFieldSeparator);
+                        if (resultInfo.Length < 5 || fields.Length < 15) break;
+
+                        var resultStatus = fields[11]?.Trim().ToUpper();
+                        var flag = fields[8]?.Trim().ToUpper();
+
+                        var results = fileData.SubmitToLabOrderDetailObrs.LastOrDefault()?.SubmitToLabOrderDetailObrResults;
+                        if (results != null)
+                        {
+                            results.Add(new SubmitToLabOrderDetailObrResult
+                            {
+                                SetId = obrSetId,
+                                LabCode = resultInfo[0],
+                                LabName = resultInfo[1],
+                                LoincCode = resultInfo[3],
+                                LoincName = resultInfo[4],
+                                Value = fields[5]?.Trim(),
+                                Unit = fields[6]?.Trim(),
+                                NormalRange = fields[7]?.Trim(),
+                                IsAbnormal = !string.IsNullOrWhiteSpace(flag) && flag != "N",
+                                Status = resultStatus == "F"
+                                    ? (int)LabResultStatus.Final
+                                    : (resultStatus == "P" ? (int)LabResultStatus.Preliminary : (int)LabResultStatus.Corrected),
+                                ObservationDateTime = fields[14]?.Trim().GetDateTime(_dateTimeFormat),
+                                CreatedOn = currentDateTime,
+                                SubmitToLabOrderDetailObrResultNotes = new EntityCollection<SubmitToLabOrderDetailObrResultNote>()
+                            });
+                        }
+                        break;
+                    case Hl7Headers.OrderNoteInformation:
+                        if (isObxProcessed)
+                        {
+                            if (fields.Length > 3)
+                            {
+                                var obx = fileData.SubmitToLabOrderDetailObrs.LastOrDefault()?.SubmitToLabOrderDetailObrResults.LastOrDefault();
+                                if (obx != null)
+                                {
+                                    obx.SubmitToLabOrderDetailObrResultNotes.Add(new SubmitToLabOrderDetailObrResultNote
+                                    {
+                                        Comment = fields[3]?.Trim()
+                                    });
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if (fields.Length > 3)
+                            {
+                                fileData.ResultComments = fields[3]?.Trim();
+                            }
+                        }
+                        break;
+                }
+            }
+            return fileData;
+        }
+
+        #endregion
+
+        #endregion
+    }
+}
